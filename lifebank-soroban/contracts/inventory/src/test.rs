@@ -1699,6 +1699,104 @@ fn test_migrate_double_run_guard() {
     );
 }
 
+// ── Storage TTL / ledger fast-forward tests (#52) ─────────────────────────────
+
+/// Advance the ledger sequence number by `ledgers` without touching the
+/// timestamp, simulating the passage of ledger time for TTL purposes.
+fn fast_forward_ledgers(env: &Env, ledgers: u32) {
+    let current = env.ledger().sequence();
+    env.ledger().set_sequence_number(current + ledgers);
+}
+
+/// Default persistent TTL (in ledgers) applied by the host when an entry is
+/// written without an explicit extend. Documented in `storage.rs`.
+const DEFAULT_PERSISTENT_TTL: u32 = 120_960; // ~7 days at 5s/ledger
+
+/// Policy horizon for blood-unit entries: product shelf life (35 days) plus a
+/// safety margin, expressed in ledgers.
+const BLOOD_UNIT_POLICY_HORIZON: u32 = 35 * 17_280 + 17_280; // 36 days
+
+#[test]
+fn test_ttl_entries_live_past_default_ttl_within_horizon() {
+    let (env, admin, client, _cid) = create_test_contract();
+    env.ledger().set_timestamp(1000u64);
+
+    let unit_id = client.register_blood(&admin, &BloodType::APositive, &450u32, &None);
+
+    // Advance past the default TTL but well within the policy horizon.
+    fast_forward_ledgers(&env, DEFAULT_PERSISTENT_TTL + 1);
+
+    // All entrypoints must still succeed — entries were bumped on access.
+    let unit = client.get_blood_unit(&unit_id);
+    assert_eq!(unit.id, unit_id);
+
+    let updated = client.update_status(&unit_id, &BloodStatus::Reserved, &admin, &None);
+    assert_eq!(updated.status, BloodStatus::Reserved);
+
+    let reservation_id = client.reserve_blood(&admin, &vec![&env, unit_id], &7u64, &3600u64);
+    let reservation = client.get_reservation(&reservation_id);
+    assert_eq!(reservation.unit_ids, vec![&env, unit_id]);
+
+    client.release_reservation(&reservation_id);
+    assert_eq!(client.get_blood_unit(&unit_id).status, BloodStatus::Available);
+}
+
+#[test]
+fn test_ttl_boundary_horizon_minus_one_still_live() {
+    let (env, admin, client, _cid) = create_test_contract();
+    env.ledger().set_timestamp(1000u64);
+
+    let unit_id = client.register_blood(&admin, &BloodType::APositive, &450u32, &None);
+
+    // horizon - 1: entry must still be readable and mutable.
+    fast_forward_ledgers(&env, BLOOD_UNIT_POLICY_HORIZON - 1);
+
+    let unit = client.get_blood_unit(&unit_id);
+    assert_eq!(unit.id, unit_id);
+    let updated = client.update_status(&unit_id, &BloodStatus::Reserved, &admin, &None);
+    assert_eq!(updated.status, BloodStatus::Reserved);
+}
+
+#[test]
+fn test_ttl_boundary_horizon_plus_one_returns_documented_error() {
+    let (env, admin, client, _cid) = create_test_contract();
+    env.ledger().set_timestamp(1000u64);
+
+    let unit_id = client.register_blood(&admin, &BloodType::APositive, &450u32, &None);
+
+    // horizon + 1: the entry is past the documented policy horizon. The
+    // contract must surface a distinct error rather than a host panic.
+    fast_forward_ledgers(&env, BLOOD_UNIT_POLICY_HORIZON + 1);
+
+    let result = client.try_get_blood_unit(&unit_id);
+    assert_eq!(
+        result,
+        Err(Ok(crate::error::ContractError::StorageHorizonExceeded))
+    );
+}
+
+#[test]
+fn test_ttl_blood_unit_live_past_product_expiry() {
+    let (env, admin, client, _cid) = create_test_contract();
+    let start = 1000u64;
+    env.ledger().set_timestamp(start);
+
+    let unit_id = client.register_blood(&admin, &BloodType::APositive, &450u32, &None);
+    let unit = client.get_blood_unit(&unit_id);
+    assert_eq!(unit.expiration_timestamp, start + SHELF_LIFE_SECS);
+
+    // Advance the ledger past the 35-day product expiry but keep the entry
+    // within the TTL policy horizon so it remains readable.
+    let past_expiry_secs = SHELF_LIFE_SECS + 86400; // expiry + 1 day
+    env.ledger().set_timestamp(start + past_expiry_secs);
+    fast_forward_ledgers(&env, 35 * 17_280 + 1);
+
+    // The unit is still live (readable) even though it is past expiry.
+    let stored = client.get_blood_unit(&unit_id);
+    assert_eq!(stored.id, unit_id);
+    assert_eq!(stored.expiration_timestamp, start + SHELF_LIFE_SECS);
+}
+
 // ── Reservations ──────────────────────────────────────────────────────────────
 
 #[test]

@@ -10,24 +10,15 @@ mod test;
 
 pub use crate::error::ContractError;
 pub use crate::types::{
-    BloodComponent, BloodRequest, BloodType, ContractMetadata, DataKey, RequestCreatedEvent,
-    RequestStatus, Urgency,
+    ContractMetadata, DataKey, RequestCreatedEvent,
+};
+pub use interfaces::{
+    BloodComponent, BloodRequest, BloodType, InventoryContractClient, RequestStatus, Urgency,
 };
 
 mod validation;
 
 use soroban_sdk::{contract, contractimpl, Address, Env};
-
-mod inventory_client {
-    use soroban_sdk::{contractclient, Env};
-
-    #[contractclient(name = "InventoryContractClient")]
-    pub trait InventoryContractInterface {
-        fn release_reservation(env: Env, reservation_id: u64);
-    }
-}
-
-use inventory_client::InventoryContractClient;
 
 #[contract]
 pub struct RequestContract;

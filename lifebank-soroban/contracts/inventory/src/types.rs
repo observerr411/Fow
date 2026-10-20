@@ -1,166 +1,11 @@
 use crate::error::ContractError;
-use soroban_sdk::{contracttype, Address, Map, String, Symbol, Vec};
+use interfaces::inventory::{BloodStatus, BloodType, BloodUnit, Reservation};
+use soroban_sdk::{contracttype, Address, String, Vec};
 
-/// Blood type enumeration supporting all major blood groups
-///
-/// Each variant represents a unique combination of ABO and Rh blood typing:
-/// - A+, A-: Type A with positive/negative Rh factor
-/// - B+, B-: Type B with positive/negative Rh factor  
-/// - AB+, AB-: Type AB with positive/negative Rh factor
-/// - O+, O-: Type O with positive/negative Rh factor
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq, Copy)]
-pub enum BloodType {
-    /// Type A positive (A+)
-    APositive,
-    /// Type A negative (A-)
-    ANegative,
-    /// Type B positive (B+)
-    BPositive,
-    /// Type B negative (B-)
-    BNegative,
-    /// Type AB positive (AB+) - Universal plasma donor
-    ABPositive,
-    /// Type AB negative (AB-)
-    ABNegative,
-    /// Type O positive (O+)
-    OPositive,
-    /// Type O negative (O-) - Universal blood donor
-    ONegative,
-}
-
-/// Blood unit status representing its current state in the supply chain
-///
-/// Status transitions follow this flow:
-/// Available -> Reserved -> InTransit -> Delivered
-///           \-> Expired (can happen at any stage)
-///           \-> Compromised (temperature violations trigger this)
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq, Copy)]
-pub enum BloodStatus {
-    /// Available for reservation - initial state after donation processing
-    Available,
-    /// Reserved for a specific request but not yet shipped
-    Reserved,
-    /// Currently being transported to destination
-    InTransit,
-    /// Successfully delivered to recipient/hospital
-    Delivered,
-    /// Expired and no longer usable (typically after 42 days for whole blood)
-    Expired,
-    /// Compromised due to 3 consecutive temperature violations - unsafe for use
-    Compromised,
-    /// Formally disposed of after expiry or compromise — permanent end-of-life
-    Disposed,
-}
-
-/// Complete blood unit record stored in the inventory contract
-///
-/// Represents a single unit of donated blood with full tracking information
-/// from donation through delivery or expiration.
-///
-/// # Storage Keys
-/// - Primary key: `id` (u64)
-/// - Secondary indexes: `blood_type`, `bank_id`, `status`
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct BloodUnit {
-    /// Unique identifier for this blood unit
-    pub id: u64,
-
-    /// Blood type (A+, A-, B+, B-, AB+, AB-, O+, O-)
-    pub blood_type: BloodType,
-
-    /// Volume in milliliters (ml)
-    /// Standard unit: 450ml ± 10% for whole blood
-    /// Typical range: 400-500ml
-    pub quantity_ml: u32,
-
-    /// Blood bank address that manages this unit
-    pub bank_id: Address,
-
-    /// Optional donor address (may be anonymous)
-    /// None indicates anonymous donation
-    pub donor_id: Option<Address>,
-
-    /// Unix timestamp (seconds) when donation was collected
-    pub donation_timestamp: u64,
-
-    /// Unix timestamp (seconds) when unit expires
-    /// Typically 42 days from donation for whole blood
-    /// 5 days for platelets, 1 year for frozen plasma
-    pub expiration_timestamp: u64,
-
-    /// Current status in supply chain
-    pub status: BloodStatus,
-
-    /// Extensible metadata for additional attributes
-    /// Examples: test_results, storage_location, lot_number, processing_notes
-    pub metadata: Map<Symbol, String>,
-}
-
-impl BloodType {
-    /// Check if this blood type can donate to the recipient blood type
-    ///
-    /// Based on compatibility rules:
-    /// - O- can donate to all types (universal donor)
-    /// - AB+ can receive from all types (universal recipient)
-    /// - Rh- can donate to Rh+ and Rh-
-    /// - Rh+ can only donate to Rh+
-    pub fn can_donate_to(&self, recipient: &BloodType) -> bool {
-        use BloodType::*;
-
-        match (self, recipient) {
-            // O- is universal donor
-            (ONegative, _) => true,
-
-            // O+ can donate to all positive types
-            (OPositive, APositive | BPositive | ABPositive | OPositive) => true,
-
-            // A- can donate to A and AB (both + and -)
-            (ANegative, APositive | ANegative | ABPositive | ABNegative) => true,
-
-            // A+ can donate to A+ and AB+
-            (APositive, APositive | ABPositive) => true,
-
-            // B- can donate to B and AB (both + and -)
-            (BNegative, BPositive | BNegative | ABPositive | ABNegative) => true,
-
-            // B+ can donate to B+ and AB+
-            (BPositive, BPositive | ABPositive) => true,
-
-            // AB- can donate to AB+ and AB-
-            (ABNegative, ABPositive | ABNegative) => true,
-
-            // AB+ can only donate to AB+
-            (ABPositive, ABPositive) => true,
-
-            // All other combinations are incompatible
-            _ => false,
-        }
-    }
-}
-
-impl BloodStatus {
-    /// Check if this status is a terminal state.
-    ///
-    /// Terminal states cannot transition to any other status.
-    /// `Compromised` is not terminal: units must move to `Disposed`.
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, BloodStatus::Delivered | BloodStatus::Disposed)
-    }
-
-    /// All statuses in deterministic order for exhaustive matrix tests.
-    pub const ALL: [BloodStatus; 7] = [
-        BloodStatus::Available,
-        BloodStatus::Reserved,
-        BloodStatus::InTransit,
-        BloodStatus::Delivered,
-        BloodStatus::Expired,
-        BloodStatus::Compromised,
-        BloodStatus::Disposed,
-    ];
-}
+// Cross-contract types (`BloodType`, `BloodStatus`, `BloodUnit`, `Reservation`)
+// are defined once in the shared `interfaces` crate and re-exported here so the
+// inventory contract and every caller share a single, compiler-enforced definition.
+pub use interfaces::inventory::{BloodStatus as SharedBloodStatus, BloodType as SharedBloodType};
 
 /// Single source of truth for legal `(from, to)` blood status transitions.
 ///
@@ -210,41 +55,39 @@ pub fn is_valid_transition(from: &BloodStatus, to: &BloodStatus) -> bool {
         .any(|(a, b)| a == from && b == to)
 }
 
-impl BloodUnit {
-    /// Validate that the blood unit data is consistent and valid
-    ///
-    /// Checks:
-    /// - Quantity is within acceptable range (100-600ml)
-    /// - Expiration is after donation
-    /// - Timestamps are reasonable (not in far future)
-    pub fn validate(&self, current_time: u64) -> Result<(), ContractError> {
-        // Validate quantity (typical range: 100-600ml)
-        if self.quantity_ml < 100 || self.quantity_ml > 600 {
-            return Err(ContractError::InvalidQuantity);
-        }
-
-        // Validate timestamps
-        if self.expiration_timestamp <= self.donation_timestamp {
-            return Err(ContractError::InvalidTimestamp);
-        }
-
-        // Donation shouldn't be from far future (allow up to 1 hour ahead for clock skew)
-        if self.donation_timestamp > current_time + 3600 {
-            return Err(ContractError::InvalidTimestamp);
-        }
-
-        Ok(())
+/// Validate that the blood unit data is consistent and valid.
+///
+/// Checks:
+/// - Quantity is within acceptable range (100-600ml)
+/// - Expiration is after donation
+/// - Timestamps are reasonable (not in far future)
+pub fn validate_blood_unit(unit: &BloodUnit, current_time: u64) -> Result<(), ContractError> {
+    // Validate quantity (typical range: 100-600ml)
+    if unit.quantity_ml < 100 || unit.quantity_ml > 600 {
+        return Err(ContractError::InvalidQuantity);
     }
 
-    /// Check if blood unit is currently expired
-    pub fn is_expired(&self, current_time: u64) -> bool {
-        current_time >= self.expiration_timestamp
+    // Validate timestamps
+    if unit.expiration_timestamp <= unit.donation_timestamp {
+        return Err(ContractError::InvalidTimestamp);
     }
 
-    /// Calculate shelf life remaining in seconds
-    pub fn shelf_life_remaining(&self, current_time: u64) -> i64 {
-        (self.expiration_timestamp as i64) - (current_time as i64)
+    // Donation shouldn't be from far future (allow up to 1 hour ahead for clock skew)
+    if unit.donation_timestamp > current_time + 3600 {
+        return Err(ContractError::InvalidTimestamp);
     }
+
+    Ok(())
+}
+
+/// Check if blood unit is currently expired
+pub fn is_expired(unit: &BloodUnit, current_time: u64) -> bool {
+    current_time >= unit.expiration_timestamp
+}
+
+/// Calculate shelf life remaining in seconds
+pub fn shelf_life_remaining(unit: &BloodUnit, current_time: u64) -> i64 {
+    (unit.expiration_timestamp as i64) - (current_time as i64)
 }
 
 /// Storage key types for efficient querying
@@ -292,17 +135,6 @@ pub enum DataKey {
 
     /// Circuit breaker: contract is paused
     Paused,
-}
-
-/// Reservation record for blood units locked for a specific requester
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Reservation {
-    pub unit_ids: Vec<u64>,
-    pub requester: Address,
-    pub created_timestamp: u64,
-    pub expiration_timestamp: u64,
-    pub request_id: u64,
 }
 
 #[contracttype]
@@ -583,7 +415,7 @@ mod tests {
             metadata: Map::new(&env),
         };
 
-        assert!(unit.validate(current_time).is_ok());
+        assert!(validate_blood_unit(&unit, current_time).is_ok());
     }
 
     #[test]
@@ -605,7 +437,7 @@ mod tests {
         };
 
         assert_eq!(
-            unit.validate(current_time),
+            validate_blood_unit(&unit, current_time),
             Err(ContractError::InvalidQuantity)
         );
     }
@@ -629,7 +461,7 @@ mod tests {
         };
 
         assert_eq!(
-            unit.validate(current_time),
+            validate_blood_unit(&unit, current_time),
             Err(ContractError::InvalidQuantity)
         );
     }
@@ -653,7 +485,7 @@ mod tests {
         };
 
         assert_eq!(
-            unit.validate(current_time),
+            validate_blood_unit(&unit, current_time),
             Err(ContractError::InvalidTimestamp)
         );
     }
@@ -677,7 +509,7 @@ mod tests {
         };
 
         assert_eq!(
-            unit.validate(current_time),
+            validate_blood_unit(&unit, current_time),
             Err(ContractError::InvalidTimestamp)
         );
     }
@@ -702,13 +534,13 @@ mod tests {
         };
 
         // Not expired before expiration time
-        assert!(!unit.is_expired(expiration_time - 1));
+        assert!(!is_expired(&unit, expiration_time - 1));
 
         // Expired at expiration time
-        assert!(unit.is_expired(expiration_time));
+        assert!(is_expired(&unit, expiration_time));
 
         // Expired after expiration time
-        assert!(unit.is_expired(expiration_time + 100));
+        assert!(is_expired(&unit, expiration_time + 100));
     }
 
     #[test]
@@ -731,12 +563,12 @@ mod tests {
         };
 
         // 30 minutes before expiration
-        assert_eq!(unit.shelf_life_remaining(donation_time + 1800), 1800);
+        assert_eq!(shelf_life_remaining(&unit, donation_time + 1800), 1800);
 
         // At expiration
-        assert_eq!(unit.shelf_life_remaining(expiration_time), 0);
+        assert_eq!(shelf_life_remaining(&unit, expiration_time), 0);
 
         // 10 minutes past expiration
-        assert_eq!(unit.shelf_life_remaining(expiration_time + 600), -600);
+        assert_eq!(shelf_life_remaining(&unit, expiration_time + 600), -600);
     }
 }

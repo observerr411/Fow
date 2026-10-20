@@ -18,6 +18,10 @@ import {
   ContractDomain,
   ContractEventEntity,
 } from './entities/contract-event.entity';
+import {
+  assertContractDomain,
+  ContractDomain as GeneratedContractDomain,
+} from '../__contracts__';
 import { IndexerCursorEntity } from './entities/indexer-cursor.entity';
 import {
   PoisonEventEntity,
@@ -56,6 +60,10 @@ export class ContractEventIndexerService {
    * or falls back to SHA-256(domain+eventType+txHash+ledger).
    */
   async ingest(dto: IngestEventDto): Promise<ContractEventEntity | null> {
+    // Validate the domain against the spec-generated contract types so the
+    // indexer cannot drift from the on-chain contract spec.
+    assertContractDomain(dto.domain);
+
     const dedupKey = dto.idempotencyKey ?? this.buildDedupKey(dto);
 
     // Conflict-safe upsert: INSERT ... ON CONFLICT DO NOTHING
@@ -155,6 +163,7 @@ export class ContractEventIndexerService {
     ledger: number,
     projectionName: string,
   ): Promise<void> {
+    assertContractDomain(domain);
     return this.advanceCursor(domain, ledger, projectionName);
   }
 
@@ -162,6 +171,7 @@ export class ContractEventIndexerService {
     domain: ContractDomain,
     projectionName: string,
   ): Promise<IndexerCursorEntity | null> {
+    assertContractDomain(domain);
     return this.cursorRepo.findOne({ where: { domain, projectionName } });
   }
 
@@ -314,6 +324,11 @@ export class ContractEventIndexerService {
     ledger: number,
     projectionName: string,
   ): Promise<void> {
+    // Narrow the persisted domain to the spec-generated union; a mismatch here
+    // means the entity enum and the on-chain contract spec have drifted.
+    const generatedDomain: GeneratedContractDomain = domain;
+    void generatedDomain;
+
     const cursor = await this.cursorRepo.findOne({
       where: { domain, projectionName },
     });

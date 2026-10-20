@@ -1,4 +1,11 @@
+use interfaces::ExcursionSummary;
 use soroban_sdk::{contracttype, Vec};
+
+// Cross-contract domain types (e.g. `ExcursionSummary`) are defined once in the
+// shared `interfaces` crate and imported here — never hand-mirrored. The
+// coordinator's cross-contract clients are likewise generated from the compiled
+// interfaces (see `contractimport!` in `lib.rs`), so any interface change is
+// caught by the compiler and the spec-drift CI check rather than at runtime.
 
 /// Canonical workflow states — shared identifier across all contracts.
 #[contracttype]
@@ -35,16 +42,6 @@ pub struct WorkflowRecord {
     /// allocation — the single source of truth for which units are held and
     /// until when (via `InventoryContractClient::get_reservation`).
     pub reservation_id: u64,
-}
-
-/// Summary of a sustained temperature excursion (mirrors temperature contract type).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExcursionSummary {
-    pub unit_id: u64,
-    pub violation_count: u32,
-    pub peak_celsius_x100: i32,
-    pub detected_at: u64,
 }
 
 #[contracttype]

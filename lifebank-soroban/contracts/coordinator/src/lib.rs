@@ -21,35 +21,18 @@ pub use types::{DataKey, ExcursionSummary, WorkflowRecord, WorkflowStatus};
 
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec};
 
+// All cross-contract types and clients come from the shared `interfaces`
+// crate — the single, compiler-enforced definition shared with every domain
+// contract. The coordinator holds no hand-mirrored domain types.
+use interfaces::{
+    BloodRequest, BloodStatus, BloodType, BloodUnit, CredentialType, DisputeReason,
+    IdentityContractClient, InventoryContractClient, Payment, PaymentContractClient,
+    PaymentStatus, RequestContractClient, RequestStatus, Reservation,
+};
+
 /// Maximum duration any pause flag may remain active (30 days).
 /// After this window all workflow paths auto-enable even if admin keys are lost.
 pub const MAX_PAUSE_SECS: u64 = 30 * 24 * 3600;
-
-// ── Minimal interface types mirroring the domain contracts ────────────────────
-// These allow the coordinator to inspect cross-contract return values without
-// importing compiled WASMs. The domain contracts must keep these in sync.
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RequestStatus {
-    Pending,
-    Approved,
-    Fulfilled,
-    Cancelled,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BloodType {
-    APositive,
-    ANegative,
-    BPositive,
-    BNegative,
-    ABPositive,
-    ABNegative,
-    OPositive,
-    ONegative,
-}
 
 /// Returns true if `donor` blood type is compatible with `recipient`.
 /// Mirrors matching::is_compatible — kept inline to avoid a cross-contract
@@ -68,165 +51,6 @@ fn is_compatible(donor: BloodType, recipient: BloodType) -> bool {
         | (ABNegative, ABNegative | ABPositive)
         | (ABPositive, ABPositive)
     )
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct BloodRequest {
-    pub id: u64,
-    pub status: RequestStatus,
-    pub blood_type: BloodType,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BloodStatus {
-    Available,
-    Reserved,
-    InTransit,
-    Delivered,
-    Expired,
-    Compromised,
-    Disposed,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct BloodUnit {
-    pub id: u64,
-    pub status: BloodStatus,
-    pub blood_type: BloodType,
-}
-
-/// Mirrors inventory::Reservation — the sole record of which units a
-/// workflow holds and until when. The coordinator never stores its own
-/// competing deadline; it always reads this back via `get_reservation`.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct Reservation {
-    pub unit_ids: Vec<u64>,
-    pub requester: Address,
-    pub created_timestamp: u64,
-    pub expiration_timestamp: u64,
-    pub request_id: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PaymentStatus {
-    Pending,
-    Locked,
-    Released,
-    Refunded,
-    Disputed,
-    Cancelled,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct Payment {
-    pub id: u64,
-    pub request_id: u64,
-    pub status: PaymentStatus,
-}
-
-// ── Cross-contract client traits ──────────────────────────────────────────────
-
-mod request_client {
-    use super::BloodRequest;
-    use soroban_sdk::{contractclient, Address, Env};
-
-    #[contractclient(name = "RequestContractClient")]
-    pub trait RequestContractInterface {
-        fn get_request(env: Env, request_id: u64) -> BloodRequest;
-    }
-}
-
-mod inventory_client {
-    use super::{BloodStatus, BloodType, BloodUnit, Reservation};
-    use soroban_sdk::{contractclient, Address, Env, String, Vec};
-
-    #[contractclient(name = "InventoryContractClient")]
-    pub trait InventoryContractInterface {
-        fn get_blood_unit(env: Env, blood_unit_id: u64) -> BloodUnit;
-        fn update_status(
-            env: Env,
-            unit_id: u64,
-            new_status: BloodStatus,
-            authorized_by: Address,
-            reason: Option<String>,
-        ) -> BloodUnit;
-        fn mark_delivered(
-            env: Env,
-            unit_id: u64,
-            authorized_by: Address,
-            delivery_location: String,
-        ) -> BloodUnit;
-        fn get_admin(env: Env) -> Address;
-        fn reserve_blood(
-            env: Env,
-            requester: Address,
-            unit_ids: Vec<u64>,
-            request_id: u64,
-            duration_seconds: u64,
-        ) -> u64;
-        fn release_reservation(env: Env, reservation_id: u64);
-        fn get_reservation(env: Env, reservation_id: u64) -> Reservation;
-        fn extend_reservation(
-            env: Env,
-            reservation_id: u64,
-            additional_seconds: u64,
-            authorized_by: Address,
-        ) -> Reservation;
-    }
-}
-
-mod payment_client {
-    use super::{Payment, PaymentStatus};
-    use soroban_sdk::{contractclient, contracttype, Address, Env, String};
-
-    #[contracttype]
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum DisputeReason {
-        FailedDelivery,
-        TemperatureExcursion,
-        PaymentContested,
-        WrongItem,
-        DamagedGoods,
-        LateDelivery,
-        Other,
-    }
-
-    #[contractclient(name = "PaymentContractClient")]
-    pub trait PaymentContractInterface {
-        fn get_payment(env: Env, payment_id: u64) -> Payment;
-        fn get_coordinator(env: Env) -> Option<Address>;
-        fn release_escrow(env: Env, caller: Address, payment_id: u64);
-        fn refund_escrow(env: Env, caller: Address, payment_id: u64);
-        fn record_dispute(env: Env, caller: Address, payment_id: u64, reason: DisputeReason, case_id: String);
-    }
-}
-
-use inventory_client::InventoryContractClient;
-use payment_client::PaymentContractClient;
-use request_client::RequestContractClient;
-
-// Credential type mirrored from identity contract (no cross-crate dep needed).
-// Kept identical to matching-contract's copy of the same mirror.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CredentialType {
-    MedicalFacilityLicense,
-    RiderCertification,
-    BloodBankAccreditation,
-    DonorEligibility,
-    LabAccreditation,
-}
-
-/// Minimal interface to the identity contract for credential gating.
-#[soroban_sdk::contractclient(name = "IdentityContractClient")]
-pub trait IdentityContractInterface {
-    fn is_valid(env: Env, subject: Address, cred: CredentialType, allow_grace: bool) -> bool;
 }
 
 const ALLOCATION_EXPIRY_SECONDS: u64 = 24 * 60 * 60;
@@ -960,7 +784,7 @@ impl CoordinatorContract {
             .try_record_dispute(
                 &env.current_contract_address(),
                 &payment_id,
-                &payment_client::DisputeReason::TemperatureExcursion,
+                &DisputeReason::TemperatureExcursion,
                 &case_id,
             )
             .map_err(|_| CoordinatorError::PaymentFlagFailed)?

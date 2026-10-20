@@ -45,4 +45,9 @@ pub enum ContractError {
 
     // Upgrade lifecycle (170)
     MigrationAlreadyApplied = 170,
+
+    // Storage TTL lifecycle (180)
+    // Returned when a persistent entry has passed its documented TTL policy
+    // horizon and is no longer live, instead of surfacing a host panic.
+    StorageHorizonExceeded = 180,
 }

@@ -1235,6 +1235,147 @@ fn test_vesting_events_emitted() {
     assert_eq!(schedule.claimed, 200_000i128);
 }
 
+// ── Storage TTL management (#52) ──────────────────────────────────────────────
+
+/// Advance the ledger sequence by `ledgers` and the timestamp by `secs`.
+fn fast_forward(env: &Env, ledgers: u32, secs: u64) {
+    env.ledger().with_mut(|l| {
+        l.sequence_number += ledgers;
+        l.timestamp += secs;
+    });
+}
+
+/// Advance the ledger sequence by `ledgers` only (timestamp unchanged).
+fn fast_forward_ledgers(env: &Env, ledgers: u32) {
+    env.ledger().with_mut(|l| l.sequence_number += ledgers);
+}
+
+/// A payment entry created at `lock` must stay live across the documented
+/// dispute-resolution horizon. Advancing past the default TTL but staying
+/// within the policy horizon must keep every entrypoint working.
+#[test]
+fn test_ttl_payment_live_past_default_ttl_within_horizon() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    let hospital = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &hospital, 10_000);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let pid = client.create_escrow(&1u64, &hospital, &payee, &1_000i128, &token_id);
+
+    // Jump well past the default persistent TTL but inside the policy horizon.
+    fast_forward(&env, LEDGERS_PER_DAY * 10, 86_400 * 10);
+
+    // Reads and settlement still succeed — no archival.
+    assert_eq!(client.get_payment(&pid).status, PaymentStatus::Locked);
+    client.release_escrow(&admin, &pid);
+    assert_eq!(client.get_payment(&pid).status, PaymentStatus::Released);
+}
+
+/// Refund path must also survive the fast-forward within the horizon.
+#[test]
+fn test_ttl_refund_live_past_default_ttl_within_horizon() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    let hospital = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &hospital, 1_000);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let pid = client.create_escrow(&1u64, &hospital, &payee, &1_000i128, &token_id);
+
+    fast_forward(&env, LEDGERS_PER_DAY * 10, 86_400 * 10);
+
+    client.refund_escrow(&admin, &pid);
+    assert_eq!(client.get_payment(&pid).status, PaymentStatus::Refunded);
+}
+
+/// Boundary test: at horizon−1 the entry is still live and usable.
+#[test]
+fn test_ttl_payment_live_at_horizon_minus_one() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    let hospital = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &hospital, 1_000);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let pid = client.create_escrow(&1u64, &hospital, &payee, &1_000i128, &token_id);
+
+    // Advance to one ledger before the policy horizon.
+    fast_forward_ledgers(&env, PAYMENT_POLICY_HORIZON_LEDGERS - 1);
+
+    assert_eq!(client.get_payment(&pid).status, PaymentStatus::Locked);
+    client.release_escrow(&admin, &pid);
+    assert_eq!(client.get_payment(&pid).status, PaymentStatus::Released);
+}
+
+/// Boundary test: at horizon+1 the entry is beyond the policy horizon and the
+/// contract must surface the documented `StorageHorizonExceeded` error rather
+/// than a host panic.
+#[test]
+fn test_ttl_payment_horizon_exceeded_at_horizon_plus_one() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    let hospital = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &hospital, 1_000);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let pid = client.create_escrow(&1u64, &hospital, &payee, &1_000i128, &token_id);
+
+    // Advance one ledger past the policy horizon.
+    fast_forward_ledgers(&env, PAYMENT_POLICY_HORIZON_LEDGERS + 1);
+
+    assert_eq!(
+        client.try_get_payment(&pid),
+        Err(Ok(Error::StorageHorizonExceeded))
+    );
+    assert_eq!(
+        client.try_release_escrow(&admin, &pid),
+        Err(Ok(Error::StorageHorizonExceeded))
+    );
+}
+
+/// Lock-then-dispute flow spanning a simulated 30-day gap: the payment entry
+/// must stay live through the dispute-resolution horizon so the dispute can be
+/// recorded and resolved after the gap.
+#[test]
+fn test_ttl_lock_then_dispute_across_30_day_gap() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+
+    let hospital = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &hospital, 1_000);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let pid = client.create_escrow(&1u64, &hospital, &payee, &1_000i128, &token_id);
+    assert_eq!(client.get_payment(&pid).status, PaymentStatus::Locked);
+
+    // Simulate a 30-day gap — well past the default TTL, inside the horizon.
+    fast_forward(&env, LEDGERS_PER_DAY * 30, 86_400 * 30);
+
+    // The locked payment is still readable and disputable.
+    assert_eq!(client.get_payment(&pid).status, PaymentStatus::Locked);
+    client.record_dispute(
+        &hospital,
+        &pid,
+        &DisputeReason::FailedDelivery,
+        &soroban_sdk::String::from_str(&env, "case-ttl"),
+    );
+    assert_eq!(client.get_payment(&pid).status, PaymentStatus::Disputed);
+
+    client.resolve_dispute(&admin, &pid);
+    client.release_escrow(&admin, &pid);
+    assert_eq!(client.get_payment(&pid).status, PaymentStatus::Released);
+}
+
 // ── Timelocked upgradeability & versioned schema (#31) ─────────────────────────
 
 #[test]

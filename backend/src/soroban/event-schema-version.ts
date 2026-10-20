@@ -1,10 +1,15 @@
-export const CONTRACT_EVENT_SCHEMA_VERSION = 1;
-export const LEGACY_CONTRACT_EVENT_SCHEMA_VERSION = 0;
-
-export const SUPPORTED_CONTRACT_EVENT_SCHEMA_VERSIONS = [
-  LEGACY_CONTRACT_EVENT_SCHEMA_VERSION,
+import {
   CONTRACT_EVENT_SCHEMA_VERSION,
-] as const;
+  LEGACY_CONTRACT_EVENT_SCHEMA_VERSION,
+  SUPPORTED_CONTRACT_EVENT_SCHEMA_VERSIONS,
+  GENERATED_CONTRACT_EVENT_SCHEMA_REGISTRY,
+} from './generated/contract-types';
+
+export {
+  CONTRACT_EVENT_SCHEMA_VERSION,
+  LEGACY_CONTRACT_EVENT_SCHEMA_VERSION,
+  SUPPORTED_CONTRACT_EVENT_SCHEMA_VERSIONS,
+};
 
 type EventLike = {
   eventData?: Record<string, unknown> | null;
@@ -80,30 +85,18 @@ export interface ContractEventSchemaEntry {
 
 /**
  * Known contract event topics and the schema versions the indexer supports.
- * Adding a new event type or version here is the single place that opts the
- * indexer into processing it — anything else is quarantined.
+ *
+ * Sourced from `./generated/contract-types`, which is code-generated from the
+ * committed contract spec XDR snapshots (see `scripts/generate-contract-types`).
+ * Do not hand-edit event shapes here — update the contract spec snapshot and
+ * regenerate so the backend, contracts and coordinator share one source of
+ * truth. Adding a new event type or version to the generated registry is the
+ * single place that opts the indexer into processing it — anything else is
+ * quarantined.
  */
 export const CONTRACT_EVENT_SCHEMA_REGISTRY: Readonly<
   Record<string, ContractEventSchemaEntry>
-> = {
-  blood_registered: {
-    versions: SUPPORTED_CONTRACT_EVENT_SCHEMA_VERSIONS,
-    requiredFields: ['unitId'],
-  },
-  custody_transferred: {
-    versions: SUPPORTED_CONTRACT_EVENT_SCHEMA_VERSIONS,
-    requiredFields: ['unitId'],
-  },
-  temperature_logged: {
-    versions: SUPPORTED_CONTRACT_EVENT_SCHEMA_VERSIONS,
-    requiredFields: ['unitId'],
-  },
-  hash_anchored: { versions: SUPPORTED_CONTRACT_EVENT_SCHEMA_VERSIONS },
-  blood_quarantined: { versions: SUPPORTED_CONTRACT_EVENT_SCHEMA_VERSIONS },
-  blood_quarantine_finalized: {
-    versions: SUPPORTED_CONTRACT_EVENT_SCHEMA_VERSIONS,
-  },
-};
+> = GENERATED_CONTRACT_EVENT_SCHEMA_REGISTRY;
 
 export type ContractEventDecodeResult =
   | {

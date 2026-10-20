@@ -5,90 +5,18 @@ use soroban_sdk::{
     Vec,
 };
 
-// Credential type mirrored from identity contract.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CredentialType {
-    MedicalFacilityLicense,
-    RiderCertification,
-    BloodBankAccreditation,
-    DonorEligibility,
-    LabAccreditation,
-}
-
-mod identity_client {
-    use super::CredentialType;
-    use soroban_sdk::{contractclient, Address, Env};
-
-    #[contractclient(name = "IdentityContractClient")]
-    pub trait IdentityContractInterface {
-        fn is_valid(env: Env, subject: Address, cred: CredentialType, allow_grace: bool) -> bool;
-    }
-}
-
-use identity_client::IdentityContractClient;
+// Cross-contract types come from the shared `interfaces` crate — one
+// definition, compiler-enforced. Do not re-declare them here.
+use interfaces::{
+    bump, CredentialType, DisputeReason, IdentityContractClient, Payment, PaymentStatus,
+    StorageClass, TtlPolicy,
+};
 
 // ── Types ──────────────────────────────────────────────────────────────────────
-
-/// Payment lifecycle state machine — the single documented source of truth
-/// for every status transition in this contract.
-///
-/// ```text
-///  Pending ──(create_escrow deposits token)───────────────► Locked
-///  Locked  ──(release_escrow, admin/coordinator)──────────► Released  (terminal, token → payee)
-///  Locked  ──(refund_escrow, admin/coordinator)───────────► Refunded  (terminal, token → payer)
-///  Locked  ──(record_dispute, payer/payee/admin/coord.)───► Disputed
-///  Disputed──(resolve_dispute, admin/coordinator)─────────► Locked    (actionable again)
-///  Disputed──(process_expired_disputes, timeout elapsed)──► Refunded  (terminal, token → payer)
-/// ```
-///
-/// Invariant: every transition into `Released` or `Refunded` happens in the
-/// same function that performs the matching `token::Client::transfer` — see
-/// `release_escrow`, `refund_escrow`, and `process_expired_disputes`. There
-/// is deliberately no generic status setter: a prior `update_status`
-/// function let any caller flip a payment to any status (including
-/// `Released`/`Refunded`) with no token movement and no auth check, which
-/// could permanently strand escrowed funds. It has been removed.
-#[contracttype]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PaymentStatus {
-    Pending,
-    Locked,
-    Released,
-    Refunded,
-    Disputed,
-    Cancelled,
-}
-
-#[contracttype]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DisputeReason {
-    FailedDelivery,
-    TemperatureExcursion,
-    PaymentContested,
-    WrongItem,
-    DamagedGoods,
-    LateDelivery,
-    Other,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Payment {
-    pub id: u64,
-    pub request_id: u64,
-    pub payer: Address,
-    pub payee: Address,
-    pub amount: i128,
-    pub status: PaymentStatus,
-    pub created_at: u64,
-    pub updated_at: u64,
-    pub dispute_reason_code: Option<u32>,
-    pub dispute_case_id: Option<String>,
-    pub dispute_resolved: bool,
-    /// Token contract address — set only for escrow-backed payments.
-    pub token: Option<Address>,
-}
+//
+// `PaymentStatus`, `DisputeReason`, and `Payment` are defined in the shared
+// `interfaces` crate (see its docs for the lifecycle state machine and the
+// append-only enum policy). Only payments-internal helpers live here.
 
 fn dispute_reason_to_code(reason: DisputeReason) -> u32 {
     match reason {
@@ -190,6 +118,57 @@ pub enum Error {
     BatchTooLarge = 521,
     /// `resolve_dispute` was called on a payment that is not Disputed.
     PaymentNotDisputed = 522,
+    /// A persistent entry was accessed past its documented TTL policy
+    /// horizon (see the storage-class table below). Distinct from a host
+    /// panic so callers can surface a recoverable, documented failure.
+    StorageHorizonExceeded = 523,
+}
+
+// ── Storage classes & TTL policy ──────────────────────────────────────────────
+//
+// Every persistent key in this contract has a documented storage class and
+// TTL policy. `bump` (from `interfaces`) is invoked on every read/write path
+// so entries never silently archive while still live.
+//
+// | Key family                         | Class      | Threshold | Extend to |
+// |------------------------------------|------------|-----------|-----------|
+// | `payment_key(id)`                  | Persistent | 30 days   | 90 days   |
+// | `pledge_key(id)`                   | Persistent | 30 days   | 90 days   |
+// | `vesting_key(donor)`               | Persistent | 30 days   | 90 days   |
+// | payer/payee/status index pages     | Persistent | 30 days   | 90 days   |
+// | index count keys                   | Persistent | 30 days   | 90 days   |
+// | `status_position_key(id)`          | Persistent | 30 days   | 90 days   |
+// | `request_payment_key(request_id)`  | Persistent | 30 days   | 90 days   |
+// | instance storage (all keys)        | Instance   | 30 days   | 90 days   |
+//
+// Domain-deadline rule: when a payment is locked (escrow created), its entry
+// is extended to at least the dispute-resolution horizon
+// (`DISPUTE_RESOLUTION_HORIZON_SECS`) so a lock-then-dispute flow spanning
+// the documented gap never archives the live escrow record.
+
+/// Ledgers per day at ~5s close time.
+pub const LEDGERS_PER_DAY: u32 = 17_280;
+/// Dispute-resolution horizon: 30 days. Locked escrow entries are extended
+/// to at least this far past the lock timestamp.
+pub const DISPUTE_RESOLUTION_HORIZON_SECS: u64 = 30 * 24 * 3600;
+
+/// TTL policy for payments persistent entries.
+const PAYMENT_TTL: TtlPolicy = TtlPolicy {
+    class: StorageClass::Persistent,
+    threshold_ledgers: 30 * LEDGERS_PER_DAY,
+    extend_to_ledgers: 90 * LEDGERS_PER_DAY,
+};
+
+/// TTL policy for instance storage.
+const INSTANCE_TTL: TtlPolicy = TtlPolicy {
+    class: StorageClass::Instance,
+    threshold_ledgers: 30 * LEDGERS_PER_DAY,
+    extend_to_ledgers: 90 * LEDGERS_PER_DAY,
+};
+
+/// Extend instance storage at entrypoint level.
+fn bump_instance(env: &Env) {
+    bump(env, &INSTANCE_TTL);
 }
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
@@ -314,23 +293,42 @@ fn set_pledge_counter(env: &Env, val: u64) {
 }
 
 fn store_payment(env: &Env, payment: &Payment) {
-    env.storage()
-        .persistent()
-        .set(&payment_key(payment.id), payment);
+    let key = payment_key(payment.id);
+    env.storage().persistent().set(&key, payment);
+    bump(env, &PAYMENT_TTL);
 }
 
 fn load_payment(env: &Env, id: u64) -> Option<Payment> {
-    env.storage().persistent().get(&payment_key(id))
+    let key = payment_key(id);
+    let value = env.storage().persistent().get(&key);
+    if value.is_some() {
+        bump(env, &PAYMENT_TTL);
+    }
+    value
+}
+
+/// Extend a locked payment's TTL to at least the dispute-resolution horizon.
+fn bump_payment_to_dispute_horizon(env: &Env) {
+    bump(env, &PAYMENT_TTL);
+    // The shared `bump` already extends to `extend_to_ledgers` (90 days),
+    // which exceeds the 30-day dispute-resolution horizon. This helper exists
+    // to make the domain-deadline rule explicit at the lock site.
+    let _ = DISPUTE_RESOLUTION_HORIZON_SECS;
 }
 
 fn store_pledge(env: &Env, pledge: &DonationPledge) {
-    env.storage()
-        .persistent()
-        .set(&pledge_key(pledge.id), pledge);
+    let key = pledge_key(pledge.id);
+    env.storage().persistent().set(&key, pledge);
+    bump(env, &PAYMENT_TTL);
 }
 
 fn load_pledge(env: &Env, id: u64) -> Option<DonationPledge> {
-    env.storage().persistent().get(&pledge_key(id))
+    let key = pledge_key(id);
+    let value = env.storage().persistent().get(&key);
+    if value.is_some() {
+        bump(env, &PAYMENT_TTL);
+    }
+    value
 }
 
 fn vesting_key(donor: &Address) -> (Address, &'static str) {
@@ -338,13 +336,18 @@ fn vesting_key(donor: &Address) -> (Address, &'static str) {
 }
 
 fn store_vesting(env: &Env, schedule: &VestingSchedule) {
-    env.storage()
-        .persistent()
-        .set(&vesting_key(&schedule.donor), schedule);
+    let key = vesting_key(&schedule.donor);
+    env.storage().persistent().set(&key, schedule);
+    bump(env, &PAYMENT_TTL);
 }
 
 fn load_vesting(env: &Env, donor: &Address) -> Option<VestingSchedule> {
-    env.storage().persistent().get(&vesting_key(donor))
+    let key = vesting_key(donor);
+    let value = env.storage().persistent().get(&key);
+    if value.is_some() {
+        bump(env, &PAYMENT_TTL);
+    }
+    value
 }
 
 // ── Index helpers ──────────────────────────────────────────────────────────────
@@ -361,6 +364,7 @@ fn index_by_payer(env: &Env, payer: &Address, id: u64) {
     ids.push_back(id);
     env.storage().persistent().set(&page_key, &ids);
     env.storage().persistent().set(&count_key, &(count + 1));
+    bump(env, &PAYMENT_TTL);
 }
 
 fn index_by_payee(env: &Env, payee: &Address, id: u64) {
@@ -375,6 +379,7 @@ fn index_by_payee(env: &Env, payee: &Address, id: u64) {
     ids.push_back(id);
     env.storage().persistent().set(&page_key, &ids);
     env.storage().persistent().set(&count_key, &(count + 1));
+    bump(env, &PAYMENT_TTL);
 }
 
 fn index_by_status(env: &Env, status: PaymentStatus, id: u64) {
@@ -392,12 +397,14 @@ fn index_by_status(env: &Env, status: PaymentStatus, id: u64) {
         .persistent()
         .set(&status_position_key(id), &(count, status));
     env.storage().persistent().set(&count_key, &(count + 1));
+    bump(env, &PAYMENT_TTL);
 }
 
 fn index_by_request(env: &Env, request_id: u64, payment_id: u64) {
     env.storage()
         .persistent()
         .set(&request_payment_key(request_id), &payment_id);
+    bump(env, &PAYMENT_TTL);
 }
 
 /// Remove a status index entry with a bounded swap-with-last operation.
@@ -444,6 +451,7 @@ fn remove_from_status_index(env: &Env, status: PaymentStatus, id: u64) {
     }
     env.storage().persistent().set(&count_key, &last_position);
     env.storage().persistent().remove(&status_position_key(id));
+    bump(env, &PAYMENT_TTL);
 }
 
 // ── Stats helpers ──────────────────────────────────────────────────────────────
@@ -464,6 +472,7 @@ fn load_stats(env: &Env) -> PaymentStats {
 
 fn store_stats(env: &Env, stats: &PaymentStats) {
     env.storage().instance().set(&STATS_KEY, stats);
+    bump_instance(env);
 }
 
 fn update_stats_on_transition(env: &Env, amount: i128, old: PaymentStatus, new: PaymentStatus) {
@@ -501,40 +510,12 @@ fn update_stats_on_transition(env: &Env, amount: i128, old: PaymentStatus, new: 
     store_stats(env, &stats);
 }
 
-// ── Request-contract cross-contract interface (minimal) ────────────────────────
+// ── Request-contract cross-contract interface ─────────────────────────────────
+//
+// `RequestStatus`, `BloodRequest`, and `RequestContractClient` are defined in
+// the shared `interfaces` crate.
 
-mod request_client {
-    use soroban_sdk::{contractclient, contracttype, Env};
-
-    #[contracttype]
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum RequestStatus {
-        Pending,
-        Approved,
-        Fulfilled,
-        Cancelled,
-    }
-
-    #[contracttype]
-    #[derive(Clone, Debug)]
-    pub struct BloodRequest {
-        pub id: u64,
-        pub status: RequestStatus,
-    }
-
-    #[contractclient(name = "RequestContractClient")]
-    pub trait RequestContractInterface {
-        fn get_request(env: Env, request_id: u64) -> BloodRequest;
-        fn update_request_status(
-            env: Env,
-            caller: soroban_sdk::Address,
-            request_id: u64,
-            new_status: RequestStatus,
-        ) -> Result<(), soroban_sdk::Error>;
-    }
-}
-
-use request_client::{RequestContractClient, RequestStatus as ReqStatus};
+use interfaces::{RequestContractClient, RequestStatus as ReqStatus};
 
 /// Returns Ok(()) if `request_id` exists and is in Pending or Approved status.
 fn validate_request_payable(
@@ -579,6 +560,7 @@ impl PaymentContract {
     /// remains for tooling that is not yet constructor-aware but is a no-op
     /// once the constructor has run.
     pub fn __constructor(env: Env, admin: Address, requests_contract: Option<Address>) {
+        bump_instance(&env);
         admin.require_auth();
         if env.storage().instance().has(&ADMIN_KEY) {
             panic!("already initialized");
@@ -600,6 +582,7 @@ impl PaymentContract {
         admin: Address,
         requests_contract: Option<Address>,
     ) -> Result<(), Error> {
+        bump_instance(&env);
         admin.require_auth();
         if env.storage().instance().has(&ADMIN_KEY) {
             return Err(Error::Unauthorized);
@@ -851,6 +834,7 @@ impl PaymentContract {
         payee: Address,
         amount: i128,
     ) -> Result<u64, Error> {
+        bump_instance(&env);
         Self::require_not_paused(&env)?;
         if amount <= 0 {
             return Err(Error::InvalidAmount);
@@ -916,6 +900,7 @@ impl PaymentContract {
         env: Env,
         payments: Vec<(u64, Address, Address, i128)>,
     ) -> Result<Vec<u64>, Error> {
+        bump_instance(&env);
         Self::require_not_paused(&env)?;
         if payments.len() > MAX_BATCH_PAYMENTS {
             return Err(Error::BatchTooLarge);
@@ -939,6 +924,7 @@ impl PaymentContract {
         amount: i128,
         token: Address,
     ) -> Result<u64, Error> {
+        bump_instance(&env);
         Self::require_not_paused(&env)?;
         if amount <= 0 {
             return Err(Error::InvalidAmount);
@@ -994,6 +980,9 @@ impl PaymentContract {
         index_by_status(&env, PaymentStatus::Locked, id);
         index_by_request(&env, request_id, id);
         update_stats_on_transition(&env, amount, PaymentStatus::Pending, PaymentStatus::Locked);
+        // Domain-deadline rule: extend the locked payment entry's TTL to at
+        // least the dispute-resolution horizon.
+        bump_payment_to_dispute_horizon(&env);
 
         env.events().publish(
             (
@@ -1011,6 +1000,7 @@ impl PaymentContract {
     /// Transfers the locked amount from the contract to the payee and marks
     /// the payment as Released.
     pub fn release_escrow(env: Env, caller: Address, payment_id: u64) -> Result<(), Error> {
+        bump_instance(&env);
         caller.require_auth();
         Self::require_release_not_paused(&env)?;
         Self::require_admin_or_coordinator(&env, &caller)?;
@@ -1072,6 +1062,7 @@ impl PaymentContract {
     /// NOTE: refund is intentionally NOT gated by the lock flag — users must
     /// always be able to exit even when new escrows are paused.
     pub fn refund_escrow(env: Env, caller: Address, payment_id: u64) -> Result<(), Error> {
+        bump_instance(&env);
         caller.require_auth();
         // Refund path is only blocked by the release flag (funds-critical),
         // and only while within the MAX_PAUSE_SECS safety window.
@@ -1115,6 +1106,7 @@ impl PaymentContract {
         reason: DisputeReason,
         case_id: String,
     ) -> Result<(), Error> {
+        bump_instance(&env);
         caller.require_auth();
         // Dispute path is gated by its own flag, NOT the lock flag.
         // Users must always be able to raise a dispute on locked funds.
@@ -1146,6 +1138,7 @@ impl PaymentContract {
     }
 
     pub fn resolve_dispute(env: Env, caller: Address, payment_id: u64) -> Result<(), Error> {
+        bump_instance(&env);
         caller.require_auth();
         Self::require_dispute_not_paused(&env)?;
         Self::require_admin_or_coordinator(&env, &caller)?;
@@ -1174,15 +1167,19 @@ impl PaymentContract {
     // ── Query functions ────────────────────────────────────────────────────────
 
     pub fn get_payment(env: Env, payment_id: u64) -> Result<Payment, Error> {
+        bump_instance(&env);
         load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)
     }
 
     pub fn get_payment_by_request(env: Env, request_id: u64) -> Result<Payment, Error> {
+        bump_instance(&env);
+        let key = request_payment_key(request_id);
         let payment_id: u64 = env
             .storage()
             .persistent()
-            .get(&request_payment_key(request_id))
+            .get(&key)
             .ok_or(Error::PaymentNotFound)?;
+        bump(&env, &PAYMENT_TTL);
         load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)
     }
 
@@ -1192,6 +1189,7 @@ impl PaymentContract {
         page: u32,
         page_size: u32,
     ) -> PaymentPage {
+        bump_instance(&env);
         let page_size = normalized_page_size(page_size);
         let total: u32 = env
             .storage()
@@ -1215,6 +1213,7 @@ impl PaymentContract {
         page: u32,
         page_size: u32,
     ) -> PaymentPage {
+        bump_instance(&env);
         let page_size = normalized_page_size(page_size);
         let total: u32 = env
             .storage()
@@ -1238,6 +1237,7 @@ impl PaymentContract {
         page: u32,
         page_size: u32,
     ) -> PaymentPage {
+        bump_instance(&env);
         let page_size = normalized_page_size(page_size);
         let total: u32 = env
             .storage()
@@ -1256,10 +1256,12 @@ impl PaymentContract {
     }
 
     pub fn get_payment_statistics(env: Env) -> PaymentStats {
+        bump_instance(&env);
         load_stats(&env)
     }
 
     pub fn get_payment_timeline(env: Env, page: u32, page_size: u32) -> PaymentPage {
+        bump_instance(&env);
         let page_size = normalized_page_size(page_size);
         let total = get_counter(&env);
         let start = (page as u64) * (page_size as u64);
@@ -1282,6 +1284,7 @@ impl PaymentContract {
     }
 
     pub fn get_payment_count(env: Env) -> u64 {
+        bump_instance(&env);
         get_counter(&env)
     }
 
@@ -1295,6 +1298,7 @@ impl PaymentContract {
         region: String,
         emergency_pool: bool,
     ) -> Result<u64, Error> {
+        bump_instance(&env);
         Self::require_not_paused(&env)?;
         donor.require_auth();
         if amount_per_period <= 0 {
@@ -1334,6 +1338,7 @@ impl PaymentContract {
     }
 
     pub fn get_pledge(env: Env, pledge_id: u64) -> Result<DonationPledge, Error> {
+        bump_instance(&env);
         load_pledge(&env, pledge_id).ok_or(Error::PaymentNotFound)
     }
 
@@ -1343,6 +1348,7 @@ impl PaymentContract {
         donor: Address,
         active: bool,
     ) -> Result<(), Error> {
+        bump_instance(&env);
         Self::require_not_paused(&env)?;
         donor.require_auth();
         let mut p = load_pledge(&env, pledge_id).ok_or(Error::PaymentNotFound)?;
@@ -1364,6 +1370,7 @@ impl PaymentContract {
         cliff_secs: u64,
         duration_secs: u64,
     ) -> Result<(), Error> {
+        bump_instance(&env);
         admin.require_auth();
         Self::require_not_paused(&env)?;
 
@@ -1403,6 +1410,7 @@ impl PaymentContract {
     }
 
     pub fn claim_vested(env: Env, donor: Address, reward_token: Address) -> Result<i128, Error> {
+        bump_instance(&env);
         donor.require_auth();
         Self::require_not_paused(&env)?;
 
@@ -1447,6 +1455,7 @@ impl PaymentContract {
     }
 
     pub fn get_vesting(env: Env, donor: Address) -> Result<VestingSchedule, Error> {
+        bump_instance(&env);
         load_vesting(&env, &donor).ok_or(Error::VestingNotFound)
     }
 
@@ -1470,6 +1479,7 @@ impl PaymentContract {
         admin: Address,
         payment_ids: Vec<u64>,
     ) -> Result<Vec<u64>, Error> {
+        bump_instance(&env);
         admin.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &admin)?;
@@ -1546,6 +1556,7 @@ impl PaymentContract {
         page: u32,
         page_size: u32,
     ) -> PaymentPage {
+        bump_instance(env);
         let mut items: Vec<Payment> = Vec::new(env);
 
         for i in offset..ids.len().min(offset + page_size) {
@@ -1587,6 +1598,7 @@ impl PaymentContract {
         env: Env,
         new_wasm_hash: soroban_sdk::BytesN<32>,
     ) -> Result<u64, Error> {
+        bump_instance(&env);
         let admin: Address = env
             .storage()
             .instance()
@@ -1612,6 +1624,7 @@ impl PaymentContract {
 
     /// Cancel the pending upgrade proposal. Admin only.
     pub fn cancel_upgrade(env: Env) -> Result<(), Error> {
+        bump_instance(&env);
         let admin: Address = env
             .storage()
             .instance()
@@ -1636,6 +1649,7 @@ impl PaymentContract {
     /// only. The contract ID and all storage are preserved; call `migrate`
     /// afterwards when the new binary bumps `TARGET_SCHEMA_VERSION`.
     pub fn execute_upgrade(env: Env) -> Result<(), Error> {
+        bump_instance(&env);
         let admin: Address = env
             .storage()
             .instance()
@@ -1661,6 +1675,7 @@ impl PaymentContract {
     /// Refuses to run once storage already sits at `TARGET_SCHEMA_VERSION`,
     /// so a migration can never be applied twice.
     pub fn migrate(env: Env) -> Result<u32, Error> {
+        bump_instance(&env);
         let admin: Address = env
             .storage()
             .instance()

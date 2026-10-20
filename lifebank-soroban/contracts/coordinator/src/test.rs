@@ -12,9 +12,14 @@ use soroban_sdk::{
     vec, Address, Env, String, Vec,
 };
 
-use super::{
-    BloodRequest, BloodStatus, BloodType, BloodUnit, CoordinatorContract, CoordinatorContractClient,
-    CoordinatorError, Payment, PaymentStatus, RequestStatus, WorkflowStatus,
+use super::{CoordinatorContract, CoordinatorContractClient, CoordinatorError, WorkflowStatus};
+
+// Cross-contract domain types now live in the shared `interfaces` crate — the
+// single source of truth for the wire format. The coordinator no longer
+// hand-mirrors these, so the mocks below exercise the exact same
+// `contracttype` definitions as production.
+use interfaces::{
+    BloodRequest, BloodStatus, BloodType, BloodUnit, Payment, PaymentStatus, RequestStatus,
 };
 
 // ── Mock: Request contract ────────────────────────────────────────────────────
@@ -425,7 +430,7 @@ impl MockPaymentContract {
         env: Env,
         caller: Address,
         payment_id: u64,
-        _reason: super::payment_client::DisputeReason,
+        _reason: interfaces::DisputeReason,
         _case_id: String,
     ) {
         caller.require_auth();
@@ -1229,7 +1234,7 @@ fn test_deadline_extended_during_dlvr_pause() {
 
 // ── Temperature excursion → dispute integration tests (issue #477) ────────────
 
-use super::ExcursionSummary;
+use interfaces::ExcursionSummary;
 
 fn make_excursion(unit_id: u64) -> ExcursionSummary {
     ExcursionSummary {
@@ -1608,6 +1613,123 @@ fn test_allocate_accepts_universal_donor_for_all_recipients() {
             result.is_ok(),
             "O- must be accepted for recipient {:?}",
             recipient
+        );
+    }
+}
+
+// ── Shared-type wire-format drift regression ──────────────────────────────────
+//
+// The coordinator decodes cross-contract return values using the shared
+// `interfaces` definitions. If a domain contract's enum discriminants drift
+// from those definitions (a variant reordered or removed), decoding silently
+// produces the wrong variant — a correctness bug that type-checks fine. These
+// tests pin the wire format so any such drift fails loudly here instead of
+// mis-settling payments at runtime.
+
+/// A mock whose `RequestStatus` enum has the same variants as the shared
+/// definition but in a *different order* — i.e. shifted discriminants. This
+/// models a domain contract that drifted from the shared interface.
+#[contracttype]
+enum DriftedRequestStatus {
+    // Deliberately reordered vs. `interfaces::RequestStatus` (Pending, Approved,
+    // Fulfilled, ...): `Approved` now encodes as discriminant 0.
+    Approved,
+    Pending,
+    Fulfilled,
+    Rejected,
+    Cancelled,
+}
+
+#[contracttype]
+struct DriftedBloodRequest {
+    id: u64,
+    status: DriftedRequestStatus,
+    blood_type: BloodType,
+}
+
+#[contract]
+struct MockDriftedRequestContract;
+
+#[contractimpl]
+impl MockDriftedRequestContract {
+    pub fn version() -> u32 {
+        1
+    }
+
+    pub fn seed_drifted_request(env: Env, id: u64) {
+        env.storage().persistent().set(
+            &ReqKey::Request(id),
+            &DriftedBloodRequest {
+                id,
+                status: DriftedRequestStatus::Pending,
+                blood_type: BloodType::APositive,
+            },
+        );
+    }
+
+    /// Returns the drifted struct; the coordinator will decode it as the
+    /// shared `BloodRequest`, so a Pending request reads back as Approved.
+    pub fn get_request(env: Env, request_id: u64) -> DriftedBloodRequest {
+        env.storage()
+            .persistent()
+            .get(&ReqKey::Request(request_id))
+            .unwrap()
+    }
+}
+
+/// A reordered enum variant must be caught by a decode assertion: the shared
+/// definition decodes the drifted discriminant to the wrong variant, proving
+/// the wire formats differ. This is the runtime symptom the CI spec-snapshot
+/// drift check exists to catch at review time.
+#[test]
+fn test_reordered_enum_variant_is_detected_by_decode_assertion() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let drifted_id = env.register(MockDriftedRequestContract, ());
+    MockDriftedRequestContractClient::new(&env, &drifted_id).seed_drifted_request(&1u64);
+
+    // Decode the drifted return value through the *shared* type.
+    let decoded: BloodRequest =
+        MockDriftedRequestContractClient::new(&env, &drifted_id).get_request(&1u64);
+
+    // The drifted contract meant `Pending`; the shared definition decodes the
+    // same discriminant as `Approved`. The mismatch is observable, so a
+    // reordered variant can never pass silently.
+    assert_ne!(
+        decoded.status,
+        RequestStatus::Pending,
+        "reordered enum variant decoded as the intended variant — drift went undetected"
+    );
+    assert_eq!(
+        decoded.status,
+        RequestStatus::Approved,
+        "expected the shifted discriminant to decode as Approved"
+    );
+}
+
+/// The shared definitions must round-trip through the wire format unchanged:
+/// a value written and read back via the shared type keeps its variant.
+#[test]
+fn test_shared_enum_round_trips_through_wire_format() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let req_id = env.register(MockRequestContract, ());
+    let client = MockRequestContractClient::new(&env, &req_id);
+
+    for status in [
+        RequestStatus::Pending,
+        RequestStatus::Approved,
+        RequestStatus::Fulfilled,
+        RequestStatus::Rejected,
+        RequestStatus::Cancelled,
+    ] {
+        client.seed_request(&7u64, &status);
+        let decoded = client.get_request(&7u64);
+        assert_eq!(
+            decoded.status, status,
+            "shared RequestStatus failed to round-trip through the wire format"
         );
     }
 }
